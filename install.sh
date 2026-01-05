@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =============================================================================
 # Ride Status Installer
-# Version: v1.1.0
+# Version: v1.1.1
 # =============================================================================
-INSTALLER_VERSION="v1.1.0"
+INSTALLER_VERSION="v1.1.1"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before sudo is available)
@@ -48,7 +48,9 @@ if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
 fi
 echo "OS check passed."
 
-echo "Checking sudo access..."
+# We still need initial sudo ability to set up NOPASSWD.
+# After this installer runs once, future runs won't prompt for a password.
+echo "Checking sudo access (initial run may prompt for password)..."
 if ! sudo -v; then
   echo "ERROR: 'sftp' must have sudo privileges."
   exit 1
@@ -105,6 +107,41 @@ echo "Logging to $LOG_FILE"
 echo "Installer version: ${INSTALLER_VERSION}"
 
 # -----------------------------------------------------------------------------
+# Enforce passwordless sudo for sftp (NOPASSWD by default)
+# -----------------------------------------------------------------------------
+echo "Configuring passwordless sudo (NOPASSWD) for user 'sftp'..."
+
+# Ensure sftp is in sudo group (harmless if already)
+if id -nG sftp | tr ' ' '\n' | grep -qx sudo; then
+  echo "User 'sftp' is already in sudo group."
+else
+  echo "Adding 'sftp' to sudo group..."
+  sudo usermod -aG sudo sftp
+  echo "NOTE: Group membership changes typically require log out/in to take effect for new shells."
+fi
+
+SUDOERS_FILE="/etc/sudoers.d/ridestatus-sftp"
+SUDOERS_LINE="sftp ALL=(ALL) NOPASSWD:ALL"
+
+# Write only if needed
+if sudo test -f "$SUDOERS_FILE" && sudo grep -Fxq "$SUDOERS_LINE" "$SUDOERS_FILE"; then
+  echo "NOPASSWD already configured in $SUDOERS_FILE"
+else
+  echo "Writing $SUDOERS_FILE"
+  sudo tee "$SUDOERS_FILE" >/dev/null <<EOF
+# Managed by RideStatus installer (${INSTALLER_VERSION})
+# Passwordless sudo for unattended installs/upgrades
+${SUDOERS_LINE}
+EOF
+  sudo chmod 0440 "$SUDOERS_FILE"
+fi
+
+# Validate sudoers configuration
+echo "Validating sudoers configuration..."
+sudo visudo -cf /etc/sudoers >/dev/null
+echo "Sudoers validation passed."
+
+# -----------------------------------------------------------------------------
 # SSH deploy key
 # -----------------------------------------------------------------------------
 SSH_DIR="$HOME/.ssh"
@@ -156,6 +193,7 @@ sudo chmod 0755 /opt/ridestatus /opt/ridestatus/{config,backups,logs}
 # -----------------------------------------------------------------------------
 # Mosquitto configuration (listen on all interfaces)
 # -----------------------------------------------------------------------------
+echo "Configuring Mosquitto (listen on all interfaces)..."
 sudo tee /etc/mosquitto/conf.d/ridestatus.conf >/dev/null <<'EOF'
 listener 1883 0.0.0.0
 allow_anonymous true
@@ -213,3 +251,4 @@ echo "INSTALLER COMPLETE – ${INSTALLER_VERSION}"
 echo "======================================"
 echo "Node-RED URL: http://${IP_ADDR}:1880"
 echo "Install log:  ${LOG_FILE}"
+echo "Sudo mode:    NOPASSWD enabled for 'sftp'"
