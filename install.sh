@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "RideStatus Installer v0"
+echo "RideStatus Installer v1"
 echo "======================="
 
 # -----------------------------------------------------------------------------
@@ -110,7 +110,7 @@ if (( ROOT_GB < RECOMMENDED_ROOT_GB )); then
 fi
 
 # -----------------------------------------------------------------------------
-# Install minimal dependencies
+# Base packages
 # -----------------------------------------------------------------------------
 echo "Installing base packages..."
 sudo apt-get update
@@ -133,7 +133,7 @@ if [[ ! -f "$KEY_FILE" ]]; then
   echo "Generating SSH key for GitHub access..."
   ssh-keygen -t ed25519 -f "$KEY_FILE" -N ""
 else
-  echo "SSH key already exists."
+  echo "SSH key already exists: $KEY_FILE"
 fi
 
 # Permissions (after key exists)
@@ -148,13 +148,115 @@ chmod 600 "$SSH_DIR/known_hosts"
 
 echo
 echo "=============================="
-echo "ADD THIS SSH KEY TO GITHUB"
+echo "GITHUB DEPLOY KEY (READ-ONLY)"
 echo "=============================="
 cat "${KEY_FILE}.pub"
 echo
 echo "Add this key as a READ-ONLY Deploy Key to the required private repositories."
-echo "Then re-run this installer."
+echo "(Installer v2 will use it to clone private repos.)"
 echo
 
-echo "Installer v0 complete."
-exit 0
+# -----------------------------------------------------------------------------
+# Installer v1: Node-RED + Mosquitto + Ansible
+# -----------------------------------------------------------------------------
+echo "Installing RideStatus v1 components (Node-RED, Mosquitto, Ansible)..."
+
+# Build tooling for npm native modules (safe to include even if not strictly needed)
+sudo apt-get install -y \
+  nodejs \
+  npm \
+  build-essential \
+  python3 \
+  mosquitto \
+  mosquitto-clients \
+  ansible \
+  sshpass
+
+# -----------------------------------------------------------------------------
+# Create standard directories
+# -----------------------------------------------------------------------------
+echo "Creating /opt/ridestatus directories..."
+sudo mkdir -p /opt/ridestatus/{config,backups,logs}
+sudo chown -R sftp:sftp /opt/ridestatus
+sudo chmod 0755 /opt/ridestatus
+sudo chmod 0755 /opt/ridestatus/config /opt/ridestatus/backups /opt/ridestatus/logs
+
+# -----------------------------------------------------------------------------
+# Install Node-RED (global)
+# -----------------------------------------------------------------------------
+if command -v node-red >/dev/null 2>&1; then
+  echo "Node-RED already installed: $(command -v node-red)"
+else
+  echo "Installing Node-RED via npm (global)..."
+  # --unsafe-perm avoids permission issues when npm runs lifecycle scripts under sudo
+  sudo npm install -g --unsafe-perm node-red
+fi
+
+# Ensure Node-RED user directory exists
+NODE_RED_USERDIR="/home/sftp/.node-red"
+mkdir -p "$NODE_RED_USERDIR"
+chmod 0755 "$NODE_RED_USERDIR"
+
+# -----------------------------------------------------------------------------
+# systemd service for Node-RED (runs as sftp)
+# -----------------------------------------------------------------------------
+echo "Configuring systemd service: ridestatus-nodered.service"
+
+sudo tee /etc/systemd/system/ridestatus-nodered.service >/dev/null <<'EOF'
+[Unit]
+Description=RideStatus Node-RED
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+User=sftp
+Group=sftp
+WorkingDirectory=/home/sftp
+# Use -u to force Node-RED userDir (flows, settings, nodes)
+ExecStart=/usr/bin/env node-red -u /home/sftp/.node-red
+Restart=on-failure
+RestartSec=5
+# Keep memory bounded on small VMs; adjust later if needed
+Environment=NODE_OPTIONS=--max-old-space-size=256
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+
+# Enable and start Mosquitto
+echo "Enabling and starting mosquitto..."
+sudo systemctl enable mosquitto
+sudo systemctl restart mosquitto
+
+# Enable and start Node-RED
+echo "Enabling and starting ridestatus-nodered..."
+sudo systemctl enable ridestatus-nodered
+sudo systemctl restart ridestatus-nodered
+
+# -----------------------------------------------------------------------------
+# Output URLs / status
+# -----------------------------------------------------------------------------
+IP_ADDR="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+if [[ -z "${IP_ADDR:-}" ]]; then
+  IP_ADDR="127.0.0.1"
+fi
+
+echo
+echo "=============================="
+echo "INSTALLER v1 COMPLETE"
+echo "=============================="
+echo "Node-RED service:   ridestatus-nodered"
+echo "Mosquitto service:  mosquitto"
+echo
+echo "Node-RED URL:"
+echo "  http://${IP_ADDR}:1880"
+echo
+echo "Useful commands:"
+echo "  sudo systemctl status ridestatus-nodered --no-pager"
+echo "  sudo journalctl -u ridestatus-nodered -n 200 --no-pager"
+echo "  sudo systemctl status mosquitto --no-pager"
+echo
+echo "Next: Installer v2 will install MariaDB, create DB/users, run migrations, and clone private repos."
