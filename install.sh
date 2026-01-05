@@ -17,7 +17,8 @@ if [[ "$(whoami)" != "sftp" ]]; then
 fi
 
 # OS check
-if ! grep -q "24.04" /etc/os-release; then
+source /etc/os-release
+if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
   echo "ERROR: Ubuntu Server 24.04 LTS is required."
   exit 1
 fi
