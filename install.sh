@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =============================================================================
 # Ride Status Installer
-# Version: v2.0.0
+# Version: v2.0.1
 # =============================================================================
-INSTALLER_VERSION="v2.0.0"
+INSTALLER_VERSION="v2.0.1"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before sudo is available)
@@ -63,7 +63,6 @@ ROOT_GB="$(df -BG --output=size / | tail -1 | tr -d ' G')"
 
 if (( ROOT_GB < RECOMMENDED_ROOT_GB )); then
   echo "WARNING: Root filesystem is ${ROOT_GB}G (recommended >= ${RECOMMENDED_ROOT_GB}G)."
-
   ROOT_SRC="$(findmnt -n -o SOURCE / || true)"
   if [[ "$ROOT_SRC" == /dev/mapper/* && "$AUTO_EXPAND_ROOT" == "1" ]]; then
     echo "Attempting LVM auto-expand..."
@@ -169,8 +168,6 @@ echo "GITHUB DEPLOY KEY"
 echo "=============================="
 cat "${KEY_FILE}.pub"
 echo
-echo "Add this key as a READ-ONLY Deploy Key to the required private repositories."
-echo
 
 # -----------------------------------------------------------------------------
 # Installer components: Node-RED + Mosquitto + Ansible + MariaDB
@@ -201,24 +198,20 @@ sudo systemctl enable mosquitto
 sudo systemctl restart mosquitto
 
 # -----------------------------------------------------------------------------
-# MariaDB configuration (local-only bind is recommended)
+# MariaDB configuration
 # -----------------------------------------------------------------------------
 echo "Ensuring MariaDB is enabled and running..."
 sudo systemctl enable mariadb
 sudo systemctl restart mariadb
 
-# Bind-address: keep local-only by default (safer, still works for local apps)
-# Ubuntu packages already default to localhost in many cases; we enforce idempotently.
+# Keep MariaDB local-only by default
 MARIADB_BIND_FILE="/etc/mysql/mariadb.conf.d/50-server.cnf"
 if sudo test -f "$MARIADB_BIND_FILE"; then
   if sudo grep -Eq '^\s*bind-address\s*=\s*127\.0\.0\.1\s*$' "$MARIADB_BIND_FILE"; then
     echo "MariaDB bind-address already set to 127.0.0.1"
   else
     echo "Setting MariaDB bind-address to 127.0.0.1 (local-only)..."
-    sudo sed -i \
-      -e 's/^\s*bind-address\s*=.*/bind-address = 127.0.0.1/' \
-      "$MARIADB_BIND_FILE" || true
-    # If no bind-address existed, add it under [mysqld]
+    sudo sed -i -e 's/^\s*bind-address\s*=.*/bind-address = 127.0.0.1/' "$MARIADB_BIND_FILE" || true
     if ! sudo grep -Eq '^\s*bind-address\s*=' "$MARIADB_BIND_FILE"; then
       sudo awk '
         BEGIN{added=0}
@@ -233,14 +226,13 @@ if sudo test -f "$MARIADB_BIND_FILE"; then
 fi
 
 # -----------------------------------------------------------------------------
-# Database + users (fully automated; no manual SQL ever)
+# Database + users (idempotent)
 # -----------------------------------------------------------------------------
 DB_NAME="ridestatus"
 DB_APP_USER="ridestatus_app"
 DB_MIGRATE_USER="ridestatus_migrate"
 DB_ENV_FILE="${CONFIG_DIR}/db.env"
 
-# Create/stash passwords once (idempotent)
 gen_pw() { openssl rand -base64 32 | tr -d '\n'; }
 
 if [[ -f "$DB_ENV_FILE" ]]; then
@@ -274,12 +266,10 @@ CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8m
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 
--- App user: normal read/write operations
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
   ON \`${DB_NAME}\`.*
   TO '${DB_APP_USER}'@'localhost';
 
--- Migrate user: schema ownership/migrations
 GRANT ALL PRIVILEGES
   ON \`${DB_NAME}\`.*
   TO '${DB_MIGRATE_USER}'@'localhost';
@@ -291,11 +281,8 @@ echo "DB setup complete: ${DB_NAME}"
 echo "DB credentials file: ${DB_ENV_FILE}"
 
 # -----------------------------------------------------------------------------
-# Migration runner (SQL-file based, deterministic)
+# Migration runner (same as v2.0.0; safe if no migrations dir exists)
 # -----------------------------------------------------------------------------
-# Convention:
-#   /opt/ridestatus/src/ridestatus-server/migrations/*.sql
-# Applied migrations recorded in ridestatus.schema_migrations (filename + applied_at).
 MIGRATE_SCRIPT="${BIN_DIR}/ridestatus-migrate.sh"
 sudo tee "$MIGRATE_SCRIPT" >/dev/null <<'EOF'
 #!/usr/bin/env bash
@@ -324,7 +311,6 @@ echo "Running migrations from: $MIGRATIONS_DIR"
 
 mysql_cmd=(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_MIGRATE_USER" "-p${DB_MIGRATE_PASS}" "$DB_NAME")
 
-# Ensure tracking table exists
 "${mysql_cmd[@]}" <<SQL
 CREATE TABLE IF NOT EXISTS schema_migrations (
   filename VARCHAR(255) PRIMARY KEY,
@@ -378,7 +364,7 @@ sudo systemctl enable ridestatus-migrate
 sudo systemctl restart ridestatus-migrate || true
 
 # -----------------------------------------------------------------------------
-# Node-RED: install + stable credentialSecret
+# Node-RED install + FIX credentialSecret injection (v2.0.1)
 # -----------------------------------------------------------------------------
 if ! command -v node-red >/dev/null 2>&1; then
   echo "Installing Node-RED via npm (global)..."
@@ -389,30 +375,24 @@ NODE_RED_USERDIR="/home/sftp/.node-red"
 mkdir -p "$NODE_RED_USERDIR"
 chmod 0755 "$NODE_RED_USERDIR"
 
-# Stable credential secret (no hand edits, deterministic per park)
 NR_SECRET_FILE="${CONFIG_DIR}/nodered_credential_secret"
 if [[ -f "$NR_SECRET_FILE" ]]; then
-  echo "Node-RED credentialSecret already exists: $NR_SECRET_FILE"
+  echo "Node-RED credential secret already exists: $NR_SECRET_FILE"
 else
-  echo "Generating Node-RED credentialSecret..."
+  echo "Generating Node-RED credential secret..."
   umask 077
   openssl rand -hex 32 > "$NR_SECRET_FILE"
   chmod 0600 "$NR_SECRET_FILE"
 fi
 
+# IMPORTANT: reset umask so later directories aren't created as 700
+umask 022
+
+secret="$(cat "$NR_SECRET_FILE")"
 NR_SETTINGS_FILE="${NODE_RED_USERDIR}/settings.js"
-if [[ -f "$NR_SETTINGS_FILE" ]]; then
-  if grep -q "credentialSecret" "$NR_SETTINGS_FILE"; then
-    echo "Node-RED settings already has credentialSecret."
-  else
-    echo "Injecting credentialSecret into existing settings.js..."
-    secret="$(cat "$NR_SECRET_FILE")"
-    # Insert after module.exports = { line
-    perl -0777 -i -pe "s/module\.exports\s*=\s*\{\n/module.exports = {\\n    credentialSecret: '${secret}',\\n/; " "$NR_SETTINGS_FILE"
-  fi
-else
+
+if [[ ! -f "$NR_SETTINGS_FILE" ]]; then
   echo "Creating Node-RED settings.js with credentialSecret..."
-  secret="$(cat "$NR_SECRET_FILE")"
   cat > "$NR_SETTINGS_FILE" <<EOF
 /**
  * RideStatus managed settings.js
@@ -424,10 +404,23 @@ module.exports = {
 EOF
   chown sftp:sftp "$NR_SETTINGS_FILE"
   chmod 0644 "$NR_SETTINGS_FILE"
+else
+  # Case A: default template has commented credentialSecret line
+  if grep -Eq '^\s*//\s*credentialSecret\s*:' "$NR_SETTINGS_FILE"; then
+    echo "Uncommenting/replacing credentialSecret in existing settings.js..."
+    sudo -u sftp perl -i -pe "s|^\s*//\s*credentialSecret\s*:\s*.*|    credentialSecret: '${secret}',|" "$NR_SETTINGS_FILE"
+  # Case B: credentialSecret already present (leave it alone)
+  elif grep -Eq '^\s*credentialSecret\s*:' "$NR_SETTINGS_FILE"; then
+    echo "Node-RED settings.js already contains credentialSecret. Leaving as-is."
+  # Case C: insert after module.exports = {
+  else
+    echo "Inserting credentialSecret into existing settings.js..."
+    sudo -u sftp perl -0777 -i -pe "s/module\.exports\s*=\s*\{\n/module.exports = {\\n    credentialSecret: '${secret}',\\n/;" "$NR_SETTINGS_FILE"
+  fi
 fi
 
 # -----------------------------------------------------------------------------
-# Clone private repos using deploy key (read-only)
+# Clone private repos using deploy key
 # -----------------------------------------------------------------------------
 echo "Cloning private repos into ${SRC_DIR}..."
 
@@ -438,25 +431,29 @@ REPOS=(
   "ridestatus-deploy"
 )
 
-GIT_SSH_COMMAND="ssh -i ${KEY_FILE} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
-
+SSH_KEY="${KEY_FILE}"
 for repo in "${REPOS[@]}"; do
   dest="${SRC_DIR}/${repo}"
   url="git@github.com:${GITHUB_ORG}/${repo}.git"
 
   if [[ -d "${dest}/.git" ]]; then
     echo "Updating ${repo}..."
-    (cd "$dest" && GIT_SSH_COMMAND="$GIT_SSH_COMMAND" git fetch --all --prune && GIT_SSH_COMMAND="$GIT_SSH_COMMAND" git checkout -q main && GIT_SSH_COMMAND="$GIT_SSH_COMMAND" git pull -q --ff-only) \
-      || echo "WARNING: Could not update ${repo} (deploy key missing from repo, or branch not 'main')."
+    if ! (cd "$dest" && GIT_SSH_COMMAND="ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" git fetch --all --prune); then
+      echo "WARNING: fetch failed for ${repo} (deploy key access?)"
+      continue
+    fi
+    (cd "$dest" && GIT_SSH_COMMAND="ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" git checkout -q main) || true
+    (cd "$dest" && GIT_SSH_COMMAND="ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" git pull -q --ff-only) || true
   else
     echo "Cloning ${repo}..."
-    (cd "$SRC_DIR" && GIT_SSH_COMMAND="$GIT_SSH_COMMAND" git clone "$url" "$dest") \
-      || echo "WARNING: Could not clone ${repo} (deploy key missing from repo, or repo not accessible)."
+    if ! (cd "$SRC_DIR" && GIT_SSH_COMMAND="ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" git clone "$url" "$dest"); then
+      echo "WARNING: clone failed for ${repo} (deploy key missing on repo, wrong name, or no access)"
+    fi
   fi
 done
 
 # -----------------------------------------------------------------------------
-# Node-RED systemd service (ensure dependencies: mosquitto + mariadb + migrate)
+# Node-RED systemd service (ensure deps)
 # -----------------------------------------------------------------------------
 echo "Configuring systemd service: ridestatus-nodered.service"
 
